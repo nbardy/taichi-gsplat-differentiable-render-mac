@@ -139,27 +139,42 @@ forward and backward gradients at about `1e-8` absolute error in the tested
 16/32px cases with 4/8/16 splats.
 
 Native batch also matches a direct packed-2D Torch reference on MPS in small
-batched checks. A local Apple Silicon probe compared `rasterize_batch` against a
-direct Torch implementation of the same packed 2D Gaussian math:
+batched checks. A fresh Dynaworld stack benchmark compared this Taichi path
+against direct Torch and the pure Metal
+[`fast-mac-gsplat`](https://github.com/nbardy/fast-mac-gsplat) v2/v3 paths on
+the same projected circular Gaussian inputs. `% faster` uses
+`(baseline_ms / renderer_ms - 1) * 100`. `Best fast-mac` means the faster of v2
+and v3 for that row.
 
-| Case | Taichi native batch | Direct Torch | Speedup |
-| --- | ---: | ---: | ---: |
-| `B=4`, 64x64, 128 splats, forward | `22.268 ms` | `169.574 ms` | `7.6x` |
-| `B=4`, 64x64, 128 splats, forward+backward | `46.894 ms` | `791.411 ms` | `16.9x` |
-| `B=4`, 128x128, 128 splats, forward | `21.665 ms` | `667.194 ms` | `30.8x` |
-| `B=4`, 128x128, 128 splats, forward+backward | `37.359 ms` | `1350.545 ms` | `36.2x` |
+| Case | Direct Torch | Taichi native batch | Best fast-mac | Taichi faster than Torch | Best fast-mac faster than Taichi |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 64x64, B=4, G=128, sigma 1-5, forward | `126.618 ms` | `14.759 ms` | `12.861 ms` (v2) | `+758%` | `+15%` |
+| 64x64, B=4, G=128, sigma 3-8, forward | `145.510 ms` | `17.993 ms` | `15.916 ms` (v2) | `+709%` | `+13%` |
+| 64x64, B=4, G=128, sigma 1-5, fwd+bwd | `685.026 ms` | `35.858 ms` | `21.535 ms` (v2) | `+1810%` | `+67%` |
+| 64x64, B=4, G=128, sigma 3-8, fwd+bwd | `593.915 ms` | `36.881 ms` | `33.096 ms` (v2) | `+1510%` | `+11%` |
+| 128x128, B=4, G=128, sigma 1-5, forward | `83.627 ms` | `11.961 ms` | `11.050 ms` (v2) | `+599%` | `+8%` |
+| 128x128, B=4, G=128, sigma 3-8, forward | `97.898 ms` | `16.517 ms` | `11.517 ms` (v2) | `+493%` | `+43%` |
+| 128x128, B=4, G=128, sigma 1-5, fwd+bwd | `702.222 ms` | `47.335 ms` | `24.254 ms` (v2) | `+1384%` | `+95%` |
+| 128x128, B=4, G=128, sigma 3-8, fwd+bwd | `717.170 ms` | `66.641 ms` | `28.428 ms` (v2) | `+976%` | `+134%` |
 
-Forward agreement for those checks was about `1e-7` max absolute error. The
-direct Torch reference gets impractically slow at larger image/splat counts.
+Taichi is therefore substantially faster than direct Torch on these small batch
+cases, but it did not beat the fastest pure Metal fast-mac variant. It did beat
+fast-mac v3 alone in a few small batched rows; v2 was still faster in those same
+rows. Use this repository when Taichi compatibility or native Taichi batch
+integration matters. Use `fast-mac-gsplat` when maximum raster throughput is the
+priority.
 
-For comparison, the pure Metal
-[`fast-mac-gsplat`](https://github.com/nbardy/fast-mac-gsplat) repo reports
-`128x128 / 512` direct-Torch speedups around `22-27x` forward and `73-93x`
-forward+backward, plus 4K / 65,536-splat hot-path timings around `12-14 ms`
-forward for its v3 path. Use that project when maximum speed matters more than
-Taichi integration.
+Large no-Torch stress comparison:
 
-The 4K / 65,536-splat pure-Metal numbers are recorded explicitly in that repo:
+| Case | Taichi | fast-mac v2 | fast-mac v3 | Winner | Winner faster than Taichi |
+| --- | ---: | ---: | ---: | --- | ---: |
+| 1024x1024, B=1, G=65,536, sigma 1-5, forward | `54.323 ms` | `14.410 ms` | `9.717 ms` | v3 | `+459%` |
+| 1024x1024, B=1, G=65,536, sigma 3-8, forward | `63.798 ms` | `16.919 ms` | `18.117 ms` | v2 | `+277%` |
+| 1024x1024, B=1, G=65,536, sigma 1-5, fwd+bwd | `352.500 ms` | `41.148 ms` | `20.238 ms` | v3 | `+1642%` |
+| 1024x1024, B=1, G=65,536, sigma 3-8, fwd+bwd | `1081.152 ms` | `119.657 ms` | `39.510 ms` | v3 | `+2636%` |
+
+The 4K / 65,536-splat pure-Metal numbers are recorded explicitly in the
+`fast-mac-gsplat` repo:
 
 | Renderer | 4096x4096 / 65,536 splats | Forward | Forward+backward |
 | --- | --- | ---: | ---: |
