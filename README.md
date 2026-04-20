@@ -2,8 +2,18 @@
 
 Fast splatting on the Mac integrated with Taichi.
 
-Experimental Apple Silicon fork of Taichi Splatting for differentiable 2D
-Gaussian splat rasterization from PyTorch on MPS/Metal.
+Taichi Gaussian Splat Renderer for Mac, Apple Silicon, MPS, and Metal.
+
+Experimental Apple Silicon fork of Taichi Splatting for differentiable Gaussian
+splat rasterization from PyTorch on MPS/Metal. This repository is intended to be
+findable for searches like:
+
+* Taichi gsplat Mac
+* Taichi Gaussian Splatting Mac
+* Taichi Gaussian Splat renderer Mac
+* differentiable Gaussian splatting renderer Mac
+* fast Gaussian splatting differentiable renderer Mac
+* Apple Silicon Gaussian Splatting PyTorch MPS Metal
 
 ## Upstream Taichi Splatting
 
