@@ -9,12 +9,12 @@ from beartype.typing import Tuple, NamedTuple
 
 import taichi as ti
 
-from taichi_splatting.mapper.tile_mapper import map_to_tiles
+from taichi_splatting.mapper.tile_mapper import map_to_tiles, map_to_tiles_batch
 from taichi_splatting.taichi_queue import queued
 from taichi_splatting.taichi_lib.conversions import torch_taichi
 
-from .forward import RasterConfig, forward_kernel
-from .backward import backward_kernel
+from .forward import RasterConfig, forward_batch_kernel, forward_kernel
+from .backward import backward_batch_kernel, backward_kernel
 
 RasterOut = NamedTuple('RasterOut', [
   ('image', torch.Tensor),
@@ -95,6 +95,74 @@ def render_function(config: RasterConfig,
     
   return _module_function
 
+
+@cache
+def render_function_batch(config: RasterConfig,
+                   points_requires_grad: bool,
+                   features_requires_grad: bool,
+                   feature_size: int,
+                   dtype=torch.float32):
+
+  forward = forward_batch_kernel(config, feature_size=feature_size, dtype=torch_taichi[dtype])
+  backward = backward_batch_kernel(config, points_requires_grad, features_requires_grad, feature_size, dtype=torch_taichi[dtype])
+
+  forward = queued(forward)
+  backward = queued(backward)
+
+  class _module_function(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gaussians: torch.Tensor, features: torch.Tensor,
+                 overlap_to_point: torch.Tensor, tile_overlap_ranges: torch.Tensor,
+                 image_size: Tuple[Integral, Integral]) -> torch.Tensor:
+
+      shape = (gaussians.shape[0], image_size[1], image_size[0])
+      image_feature = torch.empty((*shape, features.shape[2]), dtype=dtype, device=features.device)
+      image_alpha = torch.empty(shape, dtype=dtype, device=features.device)
+
+      if config.compute_point_heuristic:
+        point_heuristic = torch.zeros((gaussians.shape[0], gaussians.shape[1], 2), dtype=dtype, device=features.device)
+      else:
+        point_heuristic = torch.empty((gaussians.shape[0], 0, 2), dtype=dtype, device=features.device)
+
+      if config.compute_visibility:
+        visibility = torch.zeros((gaussians.shape[0], gaussians.shape[1]), dtype=dtype, device=features.device)
+      else:
+        visibility = torch.empty((gaussians.shape[0], 0), dtype=dtype, device=features.device)
+
+      forward(gaussians, features, tile_overlap_ranges, overlap_to_point,
+             image_feature, image_alpha, visibility)
+
+      ctx.overlap_to_point = overlap_to_point
+      ctx.tile_overlap_ranges = tile_overlap_ranges
+      ctx.image_size = image_size
+      ctx.point_heuristic = point_heuristic
+      ctx.visibility = visibility
+
+      if config.metal_compatible:
+        ctx.mark_non_differentiable(overlap_to_point, tile_overlap_ranges, visibility, point_heuristic)
+      else:
+        ctx.mark_non_differentiable(image_alpha, overlap_to_point, tile_overlap_ranges,
+                                  visibility, point_heuristic)
+      ctx.save_for_backward(gaussians, features, image_feature)
+
+      return image_feature, image_alpha, point_heuristic, visibility
+
+    @staticmethod
+    def backward(ctx, grad_image_feature: torch.Tensor,
+                grad_alpha: torch.Tensor, grad_point_heuristics: torch.Tensor,
+      grad_visibility: torch.Tensor):
+      gaussians, features, image_feature = ctx.saved_tensors
+      grad_gaussians = torch.zeros_like(gaussians)
+      grad_features = torch.zeros_like(features)
+
+      backward(gaussians, features, ctx.tile_overlap_ranges, ctx.overlap_to_point,
+              image_feature, grad_image_feature.contiguous(), grad_alpha.contiguous(),
+              grad_gaussians, grad_features, ctx.point_heuristic)
+
+      return grad_gaussians, grad_features, None, None, None, None
+
+  return _module_function
+
 @beartype
 def rasterize_with_tiles(gaussians2d: torch.Tensor, features: torch.Tensor,
                       overlap_to_point: torch.Tensor, tile_overlap_ranges: torch.Tensor,
@@ -162,6 +230,72 @@ def rasterize(gaussians2d: torch.Tensor, depth: torch.Tensor,
   )
   
   return rasterize_with_tiles(
+    gaussians2d, features,
+    tile_overlap_ranges=tile_overlap_ranges.view(-1, 2),
+    overlap_to_point=overlap_to_point,
+    image_size=image_size,
+    config=config
+  )
+
+
+@beartype
+def rasterize_with_tiles_batch(gaussians2d: torch.Tensor, features: torch.Tensor,
+                      overlap_to_point: torch.Tensor, tile_overlap_ranges: torch.Tensor,
+                      image_size: Tuple[Integral, Integral], config: RasterConfig) -> RasterOut:
+  """
+  Rasterize a batch of images given batched 2d gaussians, features and tile
+  overlap information.
+
+  Parameters:
+      gaussians2d: (B, N, 7) packed gaussians
+      features: (B, N, F) gaussian features
+      tile_overlap_ranges: (B * TH * TW, 2) maps flattened batch/tile id to overlap range
+      overlap_to_point: (K, ) maps overlap index to local point index inside its batch
+      image_size: (width, height)
+      config: rasterization config
+
+  Returns:
+      RasterOut with image shape (B, H, W, F) and image_weight shape (B, H, W)
+  """
+  _module_function = render_function_batch(config, gaussians2d.requires_grad,
+                                   features.requires_grad, features.shape[2],
+                                   dtype=gaussians2d.dtype)
+
+  image, image_weight, point_heuristic, visibility = _module_function.apply(
+    gaussians2d, features, overlap_to_point, tile_overlap_ranges, image_size)
+
+  return RasterOut(image, image_weight, point_heuristic, visibility)
+
+
+def rasterize_batch(gaussians2d: torch.Tensor, depth: torch.Tensor,
+            features: torch.Tensor, image_size: Tuple[Integral, Integral],
+            config: RasterConfig, use_depth16: bool = False) -> RasterOut:
+  """
+  Rasterize a batch of images given batched 2d gaussians and features.
+
+  Parameters:
+      gaussians2d: (B, N, 7) packed gaussians
+      depth: (B, N, 1) depths
+      features: (B, N, F) features
+      image_size: (width, height)
+      config: rasterization config
+
+  Returns:
+      RasterOut with image shape (B, H, W, F) and image_weight shape (B, H, W)
+  """
+  assert gaussians2d.shape[:2] == depth.shape[:2] == features.shape[:2], \
+    f"Size mismatch: got {gaussians2d.shape}, {depth.shape}, {features.shape}"
+
+  overlap_to_point, tile_overlap_ranges = map_to_tiles_batch(
+    gaussians2d,
+    depth,
+    image_size=image_size,
+    config=config,
+    use_depth16=use_depth16,
+    sort_backend=config.sort_backend,
+  )
+
+  return rasterize_with_tiles_batch(
     gaussians2d, features,
     tile_overlap_ranges=tile_overlap_ranges.view(-1, 2),
     overlap_to_point=overlap_to_point,

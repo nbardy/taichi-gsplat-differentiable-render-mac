@@ -34,7 +34,7 @@ import taichi as ti
 import torch
 
 from taichi_splatting.data_types import RasterConfig
-from taichi_splatting.rasterizer import rasterize
+from taichi_splatting.rasterizer import rasterize, rasterize_batch
 from taichi_splatting.taichi_queue import TaichiQueue
 
 device = torch.device("mps")
@@ -77,6 +77,24 @@ image = raster.image + (1.0 - raster.image_weight).clamp(0.0, 1.0).unsqueeze(-1)
 loss = image.square().mean()
 loss.backward()
 ```
+
+For native batched rendering, use `rasterize_batch` with batched tensors:
+
+```python
+# gaussians2d: [B, G, 7], depth: [B, G, 1], features: [B, G, C]
+raster = rasterize_batch(
+    gaussians2d,
+    depth,
+    features,
+    image_size=(width, height),
+    config=config,
+)
+
+# raster.image: [B, H, W, C], raster.image_weight: [B, H, W]
+```
+
+The batch path uses real batch/tile keys and batched raster kernels. It does not
+pack frames into an atlas.
 
 For full 3D projection and benchmark examples, see the Dynaworld benchmark
 harness that vendors this fork:

@@ -200,3 +200,81 @@ def forward_kernel(config: RasterConfig, feature_size: int, dtype=ti.f32):
           image_alpha[pixel.y, pixel.x] = dtype(total_weight > 0)
 
   return _forward_kernel
+
+
+@cache
+def forward_batch_kernel(config: RasterConfig, feature_size: int, dtype=ti.f32):
+  lib = get_library(dtype)
+  Gaussian2D = lib.Gaussian2D
+
+  feature_vec = ti.types.vector(feature_size, dtype=dtype)
+  tile_size = config.tile_size
+  kernel_variant = config.kernel_variant
+  if kernel_variant == "auto":
+    kernel_variant = "metal_reference" if config.metal_compatible else "cuda_simt"
+
+  pdf = lib.gaussian_pdf_antialias if config.antialias else lib.gaussian_pdf
+
+  if kernel_variant != "metal_reference":
+    raise ValueError(f"Unsupported batched rasterizer forward kernel_variant={kernel_variant!r}")
+
+  @ti.kernel
+  def _forward_batch_kernel_simple(
+      # Input tensors
+      points: ti.types.ndarray(Gaussian2D.vec, ndim=2),              # [B, N, 7] 2D gaussian parameters
+      point_features: ti.types.ndarray(feature_vec, ndim=2),         # [B, N, F] gaussian features
+
+      # Tile data structures
+      tile_overlap_ranges: ti.types.ndarray(ti.math.ivec2, ndim=1),  # [B * T] start/end range of overlapping points
+      overlap_to_point: ti.types.ndarray(ti.i32, ndim=1),            # [P] mapping from overlap index to local point index
+
+      # Output image buffers
+      image_feature: ti.types.ndarray(feature_vec, ndim=3),          # [B, H, W, F] output features
+      image_alpha: ti.types.ndarray(dtype, ndim=3),                  # [B, H, W] output alpha
+
+      # Output visibility buffer
+      visibility: ti.types.ndarray(dtype, ndim=2)                    # [B, N] visibility per point
+  ):
+    batch_size, camera_height, camera_width = image_feature.shape
+    tiles_wide = (camera_width + tile_size - 1) // tile_size
+    tiles_high = (camera_height + tile_size - 1) // tile_size
+    tiles_per_image = tiles_wide * tiles_high
+
+    if ti.static(config.metal_block_dim > 0):
+      ti.loop_config(block_dim=config.metal_block_dim)
+    for batch_idx, y, x in image_feature:
+      tile_x = x // tile_size
+      tile_y = y // tile_size
+      tile_id = tile_x + tile_y * tiles_wide
+      batch_tile_id = batch_idx * tiles_per_image + tile_id
+      start_offset, end_offset = tile_overlap_ranges[batch_tile_id]
+
+      pixelf = ti.Vector([ti.cast(x, dtype) + 0.5, ti.cast(y, dtype) + 0.5])
+      accum_features = feature_vec(0.0)
+      total_weight = dtype(0.0)
+
+      for overlap_idx in range(start_offset, end_offset):
+        point_idx = overlap_to_point[overlap_idx]
+        mean, axis, sigma, point_alpha = Gaussian2D.unpack(points[batch_idx, point_idx])
+
+        gaussian_alpha = pdf(pixelf, mean, axis, sigma)
+        alpha = point_alpha * gaussian_alpha
+        alpha = ti.min(alpha, ti.static(config.clamp_max_alpha))
+
+        if alpha > ti.static(config.alpha_threshold) and total_weight < ti.static(config.saturate_threshold):
+          weight = alpha * (1.0 - total_weight)
+          total_weight += weight
+
+          if ti.static(config.use_alpha_blending):
+            accum_features += point_features[batch_idx, point_idx] * weight
+          else:
+            if total_weight >= ti.static(config.median_threshold):
+              accum_features = point_features[batch_idx, point_idx]
+
+          if ti.static(config.compute_visibility):
+            ti.atomic_add(visibility[batch_idx, point_idx], weight)
+
+      image_feature[batch_idx, y, x] = accum_features
+      image_alpha[batch_idx, y, x] = total_weight
+
+  return _forward_batch_kernel_simple

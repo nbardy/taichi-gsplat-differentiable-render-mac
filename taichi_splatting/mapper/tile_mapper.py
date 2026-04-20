@@ -202,6 +202,164 @@ def tile_mapper(config:RasterConfig, use_depth16=False, sort_backend:backend_sor
 
 
 @cache
+def batch_tile_mapper(config:RasterConfig, use_depth16=False, sort_backend:backend_sort.SortBackend="auto"):
+
+  if use_depth16 is False:
+    max_tile = 2147483647
+    key_type = torch.uint64
+    end_sort_bit = 64
+
+    @ti.func
+    def make_sort_key(depth:ti.f32, batch_tile_id:ti.i32):
+        assert depth >= 0, f"depth {depth} cannot be negative for int 32 key!"
+
+        depth_key = ti.bit_cast(depth, ti.u32)
+        return  ti.cast(depth_key, ti.u64) | (ti.cast(batch_tile_id, ti.u64) << 32)
+
+    @ti.func
+    def get_batch_tile_id(key:ti.u64) -> ti.i32:
+      return ti.cast(key >> 32, ti.i32)
+
+  else:
+    max_tile = 65535
+    key_type = torch.uint32
+    end_sort_bit = 32
+
+    @ti.func
+    def make_sort_key(depth:ti.f32, batch_tile_id:ti.i32):
+        return (ti.cast(ti.math.clamp(depth, 0, 1) * 65535, ti.u32)
+            |  (ti.cast(batch_tile_id, ti.u32) << 16))
+
+    @ti.func
+    def get_batch_tile_id(key:ti.u32) -> ti.i32:
+       return ti.cast(key >> 16, ti.i32)
+
+  tile_size = config.tile_size
+  grid_query = make_grid_query(
+    tile_size=tile_size,
+    alpha_threshold=config.alpha_threshold)
+
+  @ti.kernel
+  def tile_overlaps_batch_kernel(
+      gaussians: ti.types.ndarray(Gaussian2D.vec, ndim=2),
+      image_size: ivec2,
+
+      # outputs
+      counts: ti.types.ndarray(ti.i32, ndim=2),
+  ):
+      ti.loop_config(block_dim=128)
+      for batch_idx, point_idx in counts:
+          query = grid_query(gaussians[batch_idx, point_idx], image_size)
+          counts[batch_idx, point_idx] =  query.count_tiles()
+
+  @ti.kernel
+  def find_batch_ranges_kernel(
+      sorted_keys: ti.types.ndarray(torch_taichi[key_type], ndim=1),
+      tile_ranges: ti.types.ndarray(ti.math.ivec2, ndim=1),
+  ):
+    ti.loop_config(block_dim=1024)
+    for idx in range(sorted_keys.shape[0]):
+        batch_tile_id = get_batch_tile_id(sorted_keys[idx])
+
+        next_batch_tile_id = max_tile
+        if idx + 1 < sorted_keys.shape[0]:
+           next_batch_tile_id = get_batch_tile_id(sorted_keys[idx + 1])
+
+        if batch_tile_id != next_batch_tile_id:
+            tile_ranges[batch_tile_id][1] = idx + 1
+
+            if next_batch_tile_id < max_tile:
+              tile_ranges[next_batch_tile_id][0] = idx + 1
+
+  @ti.kernel
+  def generate_batch_sort_keys_kernel(
+      depths: ti.types.ndarray(ti.f32, ndim=2),
+      gaussians : ti.types.ndarray(Gaussian2D.vec, ndim=2),
+      cumulative_overlap_counts: ti.types.ndarray(ti.i32, ndim=1),
+      image_size: ivec2,
+
+      # outputs
+      overlap_sort_key: ti.types.ndarray(torch_taichi[key_type], ndim=1),
+      overlap_to_point: ti.types.ndarray(ti.i32, ndim=1),
+
+  ):
+    tiles_wide = image_size.x // tile_size
+    tiles_high = image_size.y // tile_size
+    tiles_per_image = tiles_wide * tiles_high
+    points_per_batch = gaussians.shape[1]
+
+    ti.loop_config(block_dim=128)
+    for flat_idx in range(cumulative_overlap_counts.shape[0]):
+      batch_idx = flat_idx // points_per_batch
+      point_idx = flat_idx - batch_idx * points_per_batch
+      query = grid_query(gaussians[batch_idx, point_idx], image_size)
+      key_idx = cumulative_overlap_counts[flat_idx]
+      depth = depths[batch_idx, point_idx]
+
+      for tile_uv in ti.grouped(ti.ndrange(*query.tile_span)):
+        if query.test_tile(tile_uv):
+          tile = tile_uv + query.min_tile
+          tile_id = tile.x + tile.y * tiles_wide
+          batch_tile_id = batch_idx * tiles_per_image + tile_id
+
+          key = make_sort_key(depth, batch_tile_id)
+          overlap_sort_key[key_idx] = key
+          overlap_to_point[key_idx] = point_idx
+          key_idx += 1
+
+  def sort_batch_tile_depths(depths:torch.Tensor, gaussians:torch.Tensor, cum_overlap_counts:torch.Tensor, total_overlap:int, image_size):
+
+    overlap_key = torch.empty((total_overlap, ), dtype=key_type, device=cum_overlap_counts.device)
+    overlap_to_point = torch.empty((total_overlap, ), dtype=torch.int32, device=cum_overlap_counts.device)
+
+    generate_batch_sort_keys_kernel(depths.squeeze(-1).contiguous(), gaussians, cum_overlap_counts, image_size,
+                                    overlap_key, overlap_to_point)
+
+    overlap_key, overlap_to_point  = backend_sort.radix_sort_pairs(
+      overlap_key, overlap_to_point, end_bit=end_sort_bit, backend=sort_backend)
+    return overlap_key, overlap_to_point
+
+  def generate_batch_tile_overlaps(gaussians, image_size):
+    overlap_counts = torch.empty(gaussians.shape[:2], dtype=torch.int32, device=gaussians.device)
+
+    if gaussians.shape[0] > 0 and gaussians.shape[1] > 0:
+      tile_overlaps_batch_kernel(gaussians, ivec2(image_size), overlap_counts)
+
+      cum_overlap_counts, total_overlap = backend_sort.full_cumsum(overlap_counts.reshape(-1), backend=sort_backend)
+      return cum_overlap_counts[:-1].contiguous(), total_overlap
+    else:
+      return torch.empty((0, ), dtype=torch.int32, device=gaussians.device), 0
+
+  @beartype
+  def f(gaussians : torch.Tensor, depths:torch.Tensor, image_size:Tuple[Integral, Integral]):
+    image_size = pad_to_tile(image_size, tile_size)
+    tile_shape = (image_size[1] // tile_size, image_size[0] // tile_size)
+    tiles_per_image = tile_shape[0] * tile_shape[1]
+    batch_tile_count = gaussians.shape[0] * tiles_per_image
+
+    assert batch_tile_count < max_tile, \
+      f"batch tile count {batch_tile_count} for batch={gaussians.shape[0]} and image size {image_size} exceeds sort key capacity"
+
+    with torch.no_grad():
+      cum_overlap_counts, total_overlap = generate_batch_tile_overlaps(
+        gaussians, image_size)
+
+      tile_ranges = torch.zeros((gaussians.shape[0], *tile_shape, 2), dtype=torch.int32, device=gaussians.device)
+
+      if total_overlap > 0:
+        overlap_key, overlap_to_point = sort_batch_tile_depths(
+          depths, gaussians, cum_overlap_counts, total_overlap, image_size)
+
+        find_batch_ranges_kernel(overlap_key, tile_ranges.view(-1, 2))
+      else:
+        overlap_to_point = torch.empty((0, ), dtype=torch.int32, device=gaussians.device)
+
+      return overlap_to_point, tile_ranges
+
+  return queued(f)
+
+
+@cache
 def compact_bucket_tile_mapper(config: RasterConfig):
   tile_size = config.tile_size
   grid_query = make_grid_query(
@@ -445,4 +603,36 @@ def map_to_tiles(gaussians : torch.Tensor, depth:torch.Tensor,
     return mapper(gaussians, depth, image_size)
 
   mapper = tile_mapper(config, use_depth16=use_depth16, sort_backend=sort_backend)
+  return mapper(gaussians, depth, image_size)
+
+
+@beartype
+def map_to_tiles_batch(gaussians : torch.Tensor, depth:torch.Tensor,
+                 image_size:Tuple[Integral, Integral],
+                 config:RasterConfig,
+                 use_depth16:bool=False,
+                 sort_backend:backend_sort.SortBackend="auto"
+                 ) -> Tuple[torch.Tensor, torch.Tensor]:
+  """ maps batched gaussians to tiles, sorted by depth within each batch/tile:
+    Parameters:
+     gaussians: (B, N, 7) torch.Tensor of packed gaussians
+     depth: (B, N, 1) torch.Tensor of depths (float32)
+     image_size: (2, ) tuple of ints, (width, height)
+     tile_config: configuration for tile mapper (tile_size etc.)
+
+    Returns:
+     overlap_to_point: (K, ) torch tensor, where K is the number of overlaps,
+       maps overlap index back to point index inside its batch
+     tile_ranges: (B, tile_y, tile_x, 2) torch tensor mapping each batch/tile
+       to a range of overlap indices
+    """
+
+  assert gaussians.ndim == 3 and gaussians.shape[2] == Gaussian2D.vec.n, f"gaussians must be BxNx{Gaussian2D.vec.n} got {gaussians.shape}"
+  assert depth.ndim == 3 and depth.shape[2] == 1, f"depths must be BxNx1, got {depth.shape}"
+  assert gaussians.shape[:2] == depth.shape[:2], f"gaussians/depth batch shape mismatch: {gaussians.shape} vs {depth.shape}"
+
+  if sort_backend in {"ordered_taichi", "bucket_taichi"}:
+    raise ValueError(f"Batched tile mapper does not support sort_backend={sort_backend!r} yet")
+
+  mapper = batch_tile_mapper(config, use_depth16=use_depth16, sort_backend=sort_backend)
   return mapper(gaussians, depth, image_size)

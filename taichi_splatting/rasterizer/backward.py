@@ -329,3 +329,123 @@ def backward_kernel(config: RasterConfig,
 
 
   return _backward_kernel
+
+
+@cache
+def backward_batch_kernel(config: RasterConfig,
+                    points_requires_grad: bool,
+                    features_requires_grad: bool,
+                    feature_size: int,
+                    dtype=ti.f32):
+
+  lib = get_library(dtype)
+  Gaussian2D = lib.Gaussian2D
+  vec2 = lib.vec2
+
+  feature_vec = ti.types.vector(feature_size, dtype=dtype)
+  tile_size = config.tile_size
+  pdf_with_grad = lib.gaussian_pdf_antialias_with_grad if config.antialias else lib.gaussian_pdf_with_grad
+  kernel_variant = config.kernel_variant
+  if kernel_variant == "auto":
+    kernel_variant = "metal_reference" if config.metal_compatible else "cuda_simt"
+
+  if config.backward_variant != "pixel_reference":
+    raise ValueError(f"Unsupported batched rasterizer backward_variant={config.backward_variant!r}")
+  if kernel_variant != "metal_reference":
+    raise ValueError(f"Unsupported batched rasterizer backward kernel_variant={kernel_variant!r}")
+
+  @ti.kernel
+  def _backward_batch_kernel_simple(
+      # Input tensors
+      points: ti.types.ndarray(Gaussian2D.vec, ndim=2),              # [B, N, 7] 2D gaussian parameters
+      point_features: ti.types.ndarray(feature_vec, ndim=2),         # [B, N, F] gaussian features
+
+      # Tile data structures
+      tile_overlap_ranges: ti.types.ndarray(ti.math.ivec2, ndim=1),  # [B * T] start/end range of overlapping points
+      overlap_to_point: ti.types.ndarray(ti.i32, ndim=1),            # [P] mapping from overlap index to local point index
+
+      # Image buffers
+      image_feature: ti.types.ndarray(feature_vec, ndim=3),          # [B, H, W, F] output features
+
+      # Input image gradients
+      grad_image_feature: ti.types.ndarray(feature_vec, ndim=3),     # [B, H, W, F] gradient of output features
+      grad_alpha: ti.types.ndarray(dtype, ndim=3),                   # [B, H, W] gradient of output alpha
+
+      # Output point gradients
+      grad_points: ti.types.ndarray(Gaussian2D.vec, ndim=2),         # [B, N, 7] gradient of gaussian parameters
+      grad_features: ti.types.ndarray(feature_vec, ndim=2),          # [B, N, F] gradient of gaussian features
+
+      # Output point heuristics
+      point_heuristic: ti.types.ndarray(vec2, ndim=2),               # [B, N] point densify heuristic
+  ):
+    batch_size, camera_height, camera_width = grad_image_feature.shape
+    tiles_wide = (camera_width + tile_size - 1) // tile_size
+    tiles_high = (camera_height + tile_size - 1) // tile_size
+    tiles_per_image = tiles_wide * tiles_high
+
+    if ti.static(config.metal_block_dim > 0):
+      ti.loop_config(block_dim=config.metal_block_dim)
+    for batch_idx, y, x in grad_image_feature:
+      tile_x = x // tile_size
+      tile_y = y // tile_size
+      tile_id = tile_x + tile_y * tiles_wide
+      batch_tile_id = batch_idx * tiles_per_image + tile_id
+      start_offset, end_offset = tile_overlap_ranges[batch_tile_id]
+      pixelf = ti.Vector([ti.cast(x, dtype) + 0.5, ti.cast(y, dtype) + 0.5])
+
+      final_weight = dtype(0.0)
+      for overlap_idx in range(start_offset, end_offset):
+        point_idx = overlap_to_point[overlap_idx]
+        mean, axis, sigma, point_alpha = Gaussian2D.unpack(points[batch_idx, point_idx])
+        gaussian_alpha, _, _, _ = pdf_with_grad(pixelf, mean, axis, sigma)
+        alpha = point_alpha * gaussian_alpha
+        alpha = ti.min(alpha, ti.static(config.clamp_max_alpha))
+        if alpha > ti.static(config.alpha_threshold) and final_weight < ti.static(config.saturate_threshold):
+          final_weight += alpha * (1.0 - final_weight)
+
+      grad_pixel_feature = grad_image_feature[batch_idx, y, x]
+      remaining_features = image_feature[batch_idx, y, x]
+      remaining_weight = final_weight
+      total_weight = dtype(0.0)
+
+      for overlap_idx in range(start_offset, end_offset):
+        point_idx = overlap_to_point[overlap_idx]
+        mean, axis, sigma, point_alpha = Gaussian2D.unpack(points[batch_idx, point_idx])
+        gaussian_alpha, dp_dmean, dp_daxis, dp_dsigma = pdf_with_grad(pixelf, mean, axis, sigma)
+        alpha = point_alpha * gaussian_alpha
+        alpha = ti.min(alpha, ti.static(config.clamp_max_alpha))
+
+        if alpha > ti.static(config.alpha_threshold) and total_weight < ti.static(config.saturate_threshold):
+          transmittance = 1.0 - total_weight
+          weight = alpha * transmittance
+          total_weight += weight
+
+          feature = point_features[batch_idx, point_idx]
+          remaining_features -= feature * weight
+          remaining_weight -= weight
+
+          one_minus_alpha = ti.max(1.0 - alpha, 1e-6)
+          feature_diff = feature * transmittance - remaining_features / one_minus_alpha
+          alpha_grad = (feature_diff * grad_pixel_feature).sum()
+          alpha_grad += grad_alpha[batch_idx, y, x] * (transmittance - remaining_weight / one_minus_alpha)
+
+          alpha_alpha_grad = point_alpha * alpha_grad
+          pos_grad = alpha_alpha_grad * dp_dmean
+
+          if ti.static(points_requires_grad):
+            grad_point = Gaussian2D.to_vec(
+              pos_grad,
+              alpha_alpha_grad * dp_daxis,
+              alpha_alpha_grad * dp_dsigma,
+              gaussian_alpha * alpha_grad)
+            ti.atomic_add(grad_points[batch_idx, point_idx], grad_point)
+
+          if ti.static(features_requires_grad):
+            ti.atomic_add(grad_features[batch_idx, point_idx], weight * grad_pixel_feature)
+
+          if ti.static(config.compute_point_heuristic):
+            ti.atomic_add(point_heuristic[batch_idx, point_idx], vec2(
+              alpha_alpha_grad ** 2,
+              ti.abs(pos_grad).sum()))
+
+  return _backward_batch_kernel_simple

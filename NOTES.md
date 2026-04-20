@@ -27,6 +27,10 @@ Why:
 This is a correctness and baseline-throughput path, not a final high-performance
 renderer.
 
+Native batch rendering now exists through `rasterize_batch`. It uses
+`[B, G, 7]` packed Gaussians, sorts keys by `(batch_id, tile_id, depth)`, and
+rasterizes directly into `[B, H, W, C]`. It intentionally does not use an atlas.
+
 ## What We Tried
 
 ### CUDA Path On Mac
@@ -131,6 +135,26 @@ Expected value:
 Caveat:
     It should probably be designed together with the fused tile-local renderer,
     because the current separated reference path is not the target architecture.
+
+### Native Batch Rasterization
+
+Status:
+    Implemented for the `metal_reference` / `pixel_reference` path.
+
+What it does:
+    Adds batched tile mapping and batched forward/backward kernels. Tile ranges
+    are indexed by flattened `(batch, tile)` IDs and overlap entries point to
+    local point IDs inside that batch.
+
+Why it matters:
+    Training with multiple frames per step no longer has to pass MPS slice views
+    through the single-image Taichi autograd function. In local checks, the
+    batched Metal path completed backward while the single-image loop comparison
+    could trip an MPS version-counter error on sliced tensors.
+
+Limit:
+    This is still the simple per-pixel reference raster kernel, not the fused
+    threadgroup sort/raster architecture.
 
 ## Accuracy Status
 
