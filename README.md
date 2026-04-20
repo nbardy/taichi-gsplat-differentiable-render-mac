@@ -4,6 +4,17 @@ Fast splatting on the Mac integrated with Taichi.
 
 Taichi Gaussian Splat Renderer for Mac, Apple Silicon, MPS, and Metal.
 
+## Which Mac Renderer Should You Use?
+
+Use this repository when you need Taichi compatibility or want a Taichi-native
+renderer path that works with PyTorch tensors on Apple Silicon.
+
+If you only want the fastest Mac raster hot path and do not need Taichi, use
+[`fast-mac-gsplat`](https://github.com/nbardy/fast-mac-gsplat). It is the
+recommended high-performance path: a blazing fast pure Metal/Torch extension
+with local tile sorting, recompute backward, and much higher throughput than
+this Taichi compatibility fork.
+
 ## Import And Run The Fastest Mac Path
 
 From this repository checkout:
@@ -126,6 +137,27 @@ Representative forward-only synthetic probes:
 Small packed-2D accuracy checks matched a direct CPU-float64 Torch reference for
 forward and backward gradients at about `1e-8` absolute error in the tested
 16/32px cases with 4/8/16 splats.
+
+Native batch also matches a direct packed-2D Torch reference on MPS in small
+batched checks. A local Apple Silicon probe compared `rasterize_batch` against a
+direct Torch implementation of the same packed 2D Gaussian math:
+
+| Case | Taichi native batch | Direct Torch | Speedup |
+| --- | ---: | ---: | ---: |
+| `B=4`, 64x64, 128 splats, forward | `22.268 ms` | `169.574 ms` | `7.6x` |
+| `B=4`, 64x64, 128 splats, forward+backward | `46.894 ms` | `791.411 ms` | `16.9x` |
+| `B=4`, 128x128, 128 splats, forward | `21.665 ms` | `667.194 ms` | `30.8x` |
+| `B=4`, 128x128, 128 splats, forward+backward | `37.359 ms` | `1350.545 ms` | `36.2x` |
+
+Forward agreement for those checks was about `1e-7` max absolute error. The
+direct Torch reference gets impractically slow at larger image/splat counts.
+
+For comparison, the pure Metal
+[`fast-mac-gsplat`](https://github.com/nbardy/fast-mac-gsplat) repo reports
+`128x128 / 512` direct-Torch speedups around `22-27x` forward and `73-93x`
+forward+backward, plus 4K / 65,536-splat hot-path timings around `12-14 ms`
+forward for its v3 path. Use that project when maximum speed matters more than
+Taichi integration.
 
 For detailed experiment notes and future directions, read [NOTES.md](NOTES.md).
 
