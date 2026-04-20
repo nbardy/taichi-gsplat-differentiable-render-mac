@@ -1,6 +1,13 @@
-# Taichi Splatting
+# Taichi Mac Splatting
 
-Rasterizer for Guassian Splatting using Taichi and PyTorch - embedded in python library. Currently very usable but in active development, so likely will break with new versions! 
+Fast splatting on the Mac integrated with Taichi.
+
+Experimental Apple Silicon fork of Taichi Splatting for differentiable 2D
+Gaussian splat rasterization from PyTorch on MPS/Metal.
+
+## Upstream Taichi Splatting
+
+Rasterizer for Gaussian Splatting using Taichi and PyTorch - embedded in a Python library. Currently very usable but in active development, so likely will break with new versions!
 
 Trainer: [here](https://github.com/uc-vision/splat-trainer)
 Viewer: [here](https://github.com/uc-vision/splat-trainer)
