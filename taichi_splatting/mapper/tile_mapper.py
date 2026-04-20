@@ -8,7 +8,7 @@ from taichi.math import ivec2
 import torch
 
 
-from taichi_splatting import cuda_lib
+from taichi_splatting import backend_sort
 from taichi_splatting.data_types import RasterConfig
 
 from taichi_splatting.taichi_lib.f32 import (Gaussian2D)
@@ -25,7 +25,7 @@ def pad_to_tile(image_size: Tuple[Integral, Integral], tile_size: int):
 
 
 @cache
-def tile_mapper(config:RasterConfig, use_depth16=False):
+def tile_mapper(config:RasterConfig, use_depth16=False, sort_backend:backend_sort.SortBackend="auto"):
 
   if use_depth16 is False:
     max_tile = 65535
@@ -153,7 +153,8 @@ def tile_mapper(config:RasterConfig, use_depth16=False):
     generate_sort_keys_kernel(depths.squeeze(1).contiguous(), tile_overlap_ranges, cum_overlap_counts, image_size,
                               overlap_key, overlap_to_point)
 
-    overlap_key, overlap_to_point  = cuda_lib.radix_sort_pairs(overlap_key, overlap_to_point, end_bit=end_sort_bit)
+    overlap_key, overlap_to_point  = backend_sort.radix_sort_pairs(
+      overlap_key, overlap_to_point, end_bit=end_sort_bit, backend=sort_backend)
     return overlap_key, overlap_to_point
   
   def generate_tile_overlaps(gaussians, image_size):
@@ -162,7 +163,7 @@ def tile_mapper(config:RasterConfig, use_depth16=False):
     if gaussians.shape[0] > 0:
       tile_overlaps_kernel(gaussians, ivec2(image_size), overlap_counts)
 
-      cum_overlap_counts, total_overlap = cuda_lib.full_cumsum(overlap_counts)
+      cum_overlap_counts, total_overlap = backend_sort.full_cumsum(overlap_counts, backend=sort_backend)
       return cum_overlap_counts[:-1], total_overlap
     else:
       return torch.empty((0, ), dtype=torch.int32, device=gaussians.device), 0
@@ -200,11 +201,226 @@ def tile_mapper(config:RasterConfig, use_depth16=False):
   return queued(f)
 
 
+@cache
+def compact_bucket_tile_mapper(config: RasterConfig):
+  tile_size = config.tile_size
+  grid_query = make_grid_query(
+    tile_size=tile_size,
+    alpha_threshold=config.alpha_threshold)
+
+  @ti.func
+  def make_bucket_key(depth: ti.f32, point_idx: ti.i32) -> ti.i64:
+    depth_key = ti.bit_cast(depth, ti.u32)
+    return (ti.cast(depth_key, ti.i64) << 32) | ti.cast(point_idx, ti.i64)
+
+  @ti.kernel
+  def count_compact_tile_overlaps_kernel(
+      gaussians: ti.types.ndarray(Gaussian2D.vec, ndim=1),
+      image_size: ivec2,
+      tile_counts: ti.types.ndarray(ti.i32, ndim=1),
+  ):
+    tiles_wide = image_size.x // tile_size
+
+    for tile_id in range(tile_counts.shape[0]):
+      tile_counts[tile_id] = 0
+
+    ti.loop_config(block_dim=128)
+    for point_idx in range(gaussians.shape[0]):
+      query = grid_query(gaussians[point_idx], image_size)
+
+      for tile_uv in ti.grouped(ti.ndrange(*query.tile_span)):
+        if query.test_tile(tile_uv):
+          tile = tile_uv + query.min_tile
+          tile_id = tile.x + tile.y * tiles_wide
+          ti.atomic_add(tile_counts[tile_id], 1)
+
+  @ti.kernel
+  def init_compact_ranges_kernel(
+      cumulative_counts: ti.types.ndarray(ti.i32, ndim=1),
+      write_offsets: ti.types.ndarray(ti.i32, ndim=1),
+      tile_ranges: ti.types.ndarray(ti.math.ivec2, ndim=1),
+  ):
+    for tile_id in range(tile_ranges.shape[0]):
+      start = cumulative_counts[tile_id]
+      end = cumulative_counts[tile_id + 1]
+      write_offsets[tile_id] = start
+      tile_ranges[tile_id][0] = start
+      tile_ranges[tile_id][1] = end
+
+  @ti.kernel
+  def fill_compact_tile_overlaps_kernel(
+      depths: ti.types.ndarray(ti.f32, ndim=1),
+      gaussians: ti.types.ndarray(Gaussian2D.vec, ndim=1),
+      image_size: ivec2,
+      write_offsets: ti.types.ndarray(ti.i32, ndim=1),
+      overlap_keys: ti.types.ndarray(ti.i64, ndim=1),
+      overlap_to_point: ti.types.ndarray(ti.i32, ndim=1),
+  ):
+    tiles_wide = image_size.x // tile_size
+
+    ti.loop_config(block_dim=128)
+    for point_idx in range(gaussians.shape[0]):
+      query = grid_query(gaussians[point_idx], image_size)
+      depth = depths[point_idx]
+
+      for tile_uv in ti.grouped(ti.ndrange(*query.tile_span)):
+        if query.test_tile(tile_uv):
+          tile = tile_uv + query.min_tile
+          tile_id = tile.x + tile.y * tiles_wide
+          out_idx = ti.atomic_add(write_offsets[tile_id], 1)
+          overlap_keys[out_idx] = make_bucket_key(depth, point_idx)
+          overlap_to_point[out_idx] = point_idx
+
+  @ti.kernel
+  def compact_insertion_sort_kernel(
+      overlap_keys: ti.types.ndarray(ti.i64, ndim=1),
+      overlap_to_point: ti.types.ndarray(ti.i32, ndim=1),
+      tile_ranges: ti.types.ndarray(ti.math.ivec2, ndim=1),
+  ):
+    ti.loop_config(block_dim=128)
+    for tile_id in range(tile_ranges.shape[0]):
+      start, end = tile_ranges[tile_id]
+
+      for i in range(start + 1, end):
+        key = overlap_keys[i]
+        value = overlap_to_point[i]
+        j = i - 1
+
+        while j >= start and overlap_keys[j] > key:
+          overlap_keys[j + 1] = overlap_keys[j]
+          overlap_to_point[j + 1] = overlap_to_point[j]
+          j -= 1
+
+        overlap_keys[j + 1] = key
+        overlap_to_point[j + 1] = value
+
+  @beartype
+  def f(gaussians: torch.Tensor, depths: torch.Tensor, image_size: Tuple[Integral, Integral]):
+    image_size = pad_to_tile(image_size, tile_size)
+    tile_shape = (image_size[1] // tile_size, image_size[0] // tile_size)
+    tile_count = tile_shape[0] * tile_shape[1]
+
+    with torch.no_grad():
+      tile_counts = torch.empty((tile_count,), dtype=torch.int32, device=gaussians.device)
+      count_compact_tile_overlaps_kernel(gaussians, ivec2(image_size), tile_counts)
+      ti.sync()
+
+      cumulative_counts, total_overlap = backend_sort.full_cumsum(tile_counts, backend="taichi_field")
+      tile_ranges = torch.empty((tile_count, 2), dtype=torch.int32, device=gaussians.device)
+      write_offsets = torch.empty((tile_count,), dtype=torch.int32, device=gaussians.device)
+      init_compact_ranges_kernel(cumulative_counts, write_offsets, tile_ranges)
+
+      if total_overlap == 0:
+        return torch.empty((0,), dtype=torch.int32, device=gaussians.device), tile_ranges.view(*tile_shape, 2)
+
+      overlap_keys = torch.empty((total_overlap,), dtype=torch.int64, device=gaussians.device)
+      overlap_to_point = torch.empty((total_overlap,), dtype=torch.int32, device=gaussians.device)
+      fill_compact_tile_overlaps_kernel(
+        depths.squeeze(1).contiguous(),
+        gaussians,
+        ivec2(image_size),
+        write_offsets,
+        overlap_keys,
+        overlap_to_point)
+
+      compact_insertion_sort_kernel(overlap_keys, overlap_to_point, tile_ranges)
+
+      return overlap_to_point, tile_ranges.view(*tile_shape, 2)
+
+  return queued(f)
+
+
+@cache
+def ordered_tile_mapper(config: RasterConfig):
+  tile_size = config.tile_size
+  grid_query = make_grid_query(
+    tile_size=tile_size,
+    alpha_threshold=config.alpha_threshold)
+
+  @ti.kernel
+  def count_ordered_tile_overlaps_kernel(
+      gaussians: ti.types.ndarray(Gaussian2D.vec, ndim=1),
+      image_size: ivec2,
+      counts: ti.types.ndarray(ti.i32, ndim=1),
+  ):
+    tiles_wide = image_size.x // tile_size
+
+    for tile_id in range(counts.shape[0]):
+      tile = ivec2(tile_id % tiles_wide, tile_id // tiles_wide)
+      count = 0
+
+      for idx in range(gaussians.shape[0]):
+        query = grid_query(gaussians[idx], image_size)
+        rel_tile = tile - query.min_tile
+        if (rel_tile.x >= 0 and rel_tile.y >= 0
+            and rel_tile.x < query.tile_span.x and rel_tile.y < query.tile_span.y
+            and query.test_tile(rel_tile)):
+          count += 1
+
+      counts[tile_id] = count
+
+  @ti.kernel
+  def ranges_from_cumsum_kernel(
+      cumulative_counts: ti.types.ndarray(ti.i32, ndim=1),
+      tile_ranges: ti.types.ndarray(ti.math.ivec2, ndim=1),
+  ):
+    for tile_id in range(tile_ranges.shape[0]):
+      tile_ranges[tile_id][0] = cumulative_counts[tile_id]
+      tile_ranges[tile_id][1] = cumulative_counts[tile_id + 1]
+
+  @ti.kernel
+  def fill_ordered_tile_overlaps_kernel(
+      gaussians: ti.types.ndarray(Gaussian2D.vec, ndim=1),
+      image_size: ivec2,
+      tile_ranges: ti.types.ndarray(ti.math.ivec2, ndim=1),
+      overlap_to_point: ti.types.ndarray(ti.i32, ndim=1),
+  ):
+    tiles_wide = image_size.x // tile_size
+
+    for tile_id in range(tile_ranges.shape[0]):
+      tile = ivec2(tile_id % tiles_wide, tile_id // tiles_wide)
+      write_idx = tile_ranges[tile_id][0]
+
+      for point_idx in range(gaussians.shape[0]):
+        query = grid_query(gaussians[point_idx], image_size)
+        rel_tile = tile - query.min_tile
+        if (rel_tile.x >= 0 and rel_tile.y >= 0
+            and rel_tile.x < query.tile_span.x and rel_tile.y < query.tile_span.y
+            and query.test_tile(rel_tile)):
+          overlap_to_point[write_idx] = point_idx
+          write_idx += 1
+
+  @beartype
+  def f(gaussians: torch.Tensor, depths: torch.Tensor, image_size: Tuple[Integral, Integral]):
+    # This path preserves input order within every tile. It is correct only when
+    # callers have already supplied gaussians in front-to-back depth order.
+    image_size = pad_to_tile(image_size, tile_size)
+    tile_shape = (image_size[1] // tile_size, image_size[0] // tile_size)
+    tile_count = tile_shape[0] * tile_shape[1]
+
+    with torch.no_grad():
+      counts = torch.empty((tile_count,), dtype=torch.int32, device=gaussians.device)
+      count_ordered_tile_overlaps_kernel(gaussians, ivec2(image_size), counts)
+      cumulative_counts, total_overlap = backend_sort.full_cumsum(counts, backend="taichi_field")
+
+      tile_ranges = torch.empty((tile_count, 2), dtype=torch.int32, device=gaussians.device)
+      ranges_from_cumsum_kernel(cumulative_counts, tile_ranges)
+
+      overlap_to_point = torch.empty((total_overlap,), dtype=torch.int32, device=gaussians.device)
+      if total_overlap > 0:
+        fill_ordered_tile_overlaps_kernel(gaussians, ivec2(image_size), tile_ranges, overlap_to_point)
+
+      return overlap_to_point, tile_ranges.view(*tile_shape, 2)
+
+  return queued(f)
+
+
 @beartype
 def map_to_tiles(gaussians : torch.Tensor, depth:torch.Tensor, 
                  image_size:Tuple[Integral, Integral],
                  config:RasterConfig,
-                 use_depth16:bool=False
+                 use_depth16:bool=False,
+                 sort_backend:backend_sort.SortBackend="auto"
                  ) -> Tuple[torch.Tensor, torch.Tensor]:
   """ maps guassians to tiles, sorted by depth (front to back):
     Parameters:
@@ -221,5 +437,12 @@ def map_to_tiles(gaussians : torch.Tensor, depth:torch.Tensor,
   assert gaussians.ndim == 2 and gaussians.shape[1] == Gaussian2D.vec.n, f"gaussians must be Nx{Gaussian2D.vec.n} got {gaussians.shape}"
   assert depth.ndim == 2 and depth.shape[1] == 1, f"depths must be Nx1, got {depth.shape}"
 
-  mapper = tile_mapper(config, use_depth16=use_depth16)
+  if sort_backend == "ordered_taichi":
+    mapper = ordered_tile_mapper(config)
+    return mapper(gaussians, depth, image_size)
+  if sort_backend == "bucket_taichi":
+    mapper = compact_bucket_tile_mapper(config)
+    return mapper(gaussians, depth, image_size)
+
+  mapper = tile_mapper(config, use_depth16=use_depth16, sort_backend=sort_backend)
   return mapper(gaussians, depth, image_size)

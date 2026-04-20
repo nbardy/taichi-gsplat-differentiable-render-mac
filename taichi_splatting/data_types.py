@@ -45,6 +45,15 @@ class RasterConfig:
 
   median_threshold: float = 0.25 # threshold for median depth computation
 
+  # Avoid CUDA-only Taichi SIMT block/warp intrinsics in the forward rasterizer.
+  # This is slower, but it can compile on Metal for forward-only experiments.
+  metal_compatible: bool = False
+  kernel_variant: str = "auto"
+  sort_backend: str = "auto"
+  backward_variant: str = "pixel_reference"
+  # 0 leaves Taichi's default loop scheduling in place.
+  metal_block_dim: int = 0
+
     
 
 def check_packed3d(packed_gaussians: torch.Tensor):
@@ -140,6 +149,3 @@ class Gaussians2D(TensorClass):
 
   def set_scaling(self, scaling) -> 'Gaussians2D':
     return self.replace(log_scaling=torch.log(scaling))
-
-
-

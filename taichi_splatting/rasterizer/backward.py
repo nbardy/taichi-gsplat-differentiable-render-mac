@@ -25,6 +25,110 @@ def backward_kernel(config: RasterConfig,
   feature_vec = ti.types.vector(feature_size, dtype=dtype)
   tile_size = config.tile_size
   tile_area = tile_size * tile_size
+  pdf_with_grad = lib.gaussian_pdf_antialias_with_grad if config.antialias else lib.gaussian_pdf_with_grad
+  kernel_variant = config.kernel_variant
+  if kernel_variant == "auto":
+    kernel_variant = "metal_reference" if config.metal_compatible else "cuda_simt"
+
+  if config.backward_variant != "pixel_reference":
+    raise ValueError(f"Unsupported rasterizer backward_variant={config.backward_variant!r}")
+
+  if kernel_variant == "metal_reference":
+    @ti.kernel
+    def _backward_kernel_simple(
+        # Input tensors
+        points: ti.types.ndarray(Gaussian2D.vec, ndim=1),              # [N, 7] 2D gaussian parameters
+        point_features: ti.types.ndarray(feature_vec, ndim=1),         # [N, F] gaussian features
+
+        # Tile data structures
+        tile_overlap_ranges: ti.types.ndarray(ti.math.ivec2, ndim=1),  # [T] start/end range of overlapping points
+        overlap_to_point: ti.types.ndarray(ti.i32, ndim=1),            # [P] mapping from overlap index to point index
+
+        # Image buffers
+        image_feature: ti.types.ndarray(feature_vec, ndim=2),          # [H, W, F] output features
+
+        # Input image gradients
+        grad_image_feature: ti.types.ndarray(feature_vec, ndim=2),     # [H, W, F] gradient of output features
+        grad_alpha: ti.types.ndarray(dtype, ndim=2),                   # [H, W] gradient of output alpha
+
+        # Output point gradients
+        grad_points: ti.types.ndarray(Gaussian2D.vec, ndim=1),         # [N, 7] gradient of gaussian parameters
+        grad_features: ti.types.ndarray(feature_vec, ndim=1),          # [N, F] gradient of gaussian features
+
+        # Output point heuristics
+        point_heuristic: ti.types.ndarray(vec2, ndim=1),               # [N] point densify heuristic
+    ):
+      camera_height, camera_width = grad_image_feature.shape
+      tiles_wide = (camera_width + tile_size - 1) // tile_size
+
+      if ti.static(config.metal_block_dim > 0):
+        ti.loop_config(block_dim=config.metal_block_dim)
+      for y, x in grad_image_feature:
+        tile_x = x // tile_size
+        tile_y = y // tile_size
+        tile_id = tile_x + tile_y * tiles_wide
+        start_offset, end_offset = tile_overlap_ranges[tile_id]
+        pixelf = ti.Vector([ti.cast(x, dtype) + 0.5, ti.cast(y, dtype) + 0.5])
+
+        final_weight = dtype(0.0)
+        for overlap_idx in range(start_offset, end_offset):
+          point_idx = overlap_to_point[overlap_idx]
+          mean, axis, sigma, point_alpha = Gaussian2D.unpack(points[point_idx])
+          gaussian_alpha, _, _, _ = pdf_with_grad(pixelf, mean, axis, sigma)
+          alpha = point_alpha * gaussian_alpha
+          alpha = ti.min(alpha, ti.static(config.clamp_max_alpha))
+          if alpha > ti.static(config.alpha_threshold) and final_weight < ti.static(config.saturate_threshold):
+            final_weight += alpha * (1.0 - final_weight)
+
+        grad_pixel_feature = grad_image_feature[y, x]
+        remaining_features = image_feature[y, x]
+        remaining_weight = final_weight
+        total_weight = dtype(0.0)
+
+        for overlap_idx in range(start_offset, end_offset):
+          point_idx = overlap_to_point[overlap_idx]
+          mean, axis, sigma, point_alpha = Gaussian2D.unpack(points[point_idx])
+          gaussian_alpha, dp_dmean, dp_daxis, dp_dsigma = pdf_with_grad(pixelf, mean, axis, sigma)
+          alpha = point_alpha * gaussian_alpha
+          alpha = ti.min(alpha, ti.static(config.clamp_max_alpha))
+
+          if alpha > ti.static(config.alpha_threshold) and total_weight < ti.static(config.saturate_threshold):
+            transmittance = 1.0 - total_weight
+            weight = alpha * transmittance
+            total_weight += weight
+
+            feature = point_features[point_idx]
+            remaining_features -= feature * weight
+            remaining_weight -= weight
+
+            one_minus_alpha = ti.max(1.0 - alpha, 1e-6)
+            feature_diff = feature * transmittance - remaining_features / one_minus_alpha
+            alpha_grad = (feature_diff * grad_pixel_feature).sum()
+            alpha_grad += grad_alpha[y, x] * (transmittance - remaining_weight / one_minus_alpha)
+
+            alpha_alpha_grad = point_alpha * alpha_grad
+            pos_grad = alpha_alpha_grad * dp_dmean
+
+            if ti.static(points_requires_grad):
+              grad_point = Gaussian2D.to_vec(
+                pos_grad,
+                alpha_alpha_grad * dp_daxis,
+                alpha_alpha_grad * dp_dsigma,
+                gaussian_alpha * alpha_grad)
+              ti.atomic_add(grad_points[point_idx], grad_point)
+
+            if ti.static(features_requires_grad):
+              ti.atomic_add(grad_features[point_idx], weight * grad_pixel_feature)
+
+            if ti.static(config.compute_point_heuristic):
+              ti.atomic_add(point_heuristic[point_idx], vec2(
+                alpha_alpha_grad ** 2,
+                ti.abs(pos_grad).sum()))
+
+    return _backward_kernel_simple
+
+  if kernel_variant != "cuda_simt":
+    raise ValueError(f"Unsupported rasterizer backward kernel_variant={kernel_variant!r}")
 
   thread_pixels = config.pixel_stride[0] * config.pixel_stride[1]
   block_area = tile_area // thread_pixels
@@ -44,7 +148,6 @@ def backward_kernel(config: RasterConfig,
 
   # Select implementations based on dtype
   warp_add_vector = warp_add_vector_32 if dtype == ti.f32 else warp_add_vector_64
-  pdf_with_grad = lib.gaussian_pdf_antialias_with_grad if config.antialias else lib.gaussian_pdf_with_grad
   # pdf = lib.gaussian_pdf_antialias if config.antialias else lib.gaussian_pdf
 
   @ti.kernel
@@ -62,6 +165,7 @@ def backward_kernel(config: RasterConfig,
 
       # Input image gradients
       grad_image_feature: ti.types.ndarray(feature_vec, ndim=2),     # [H, W, F] gradient of output features
+      grad_alpha: ti.types.ndarray(dtype, ndim=2),                   # [H, W] gradient of output alpha
 
       # Output point gradients
       grad_points: ti.types.ndarray(Gaussian2D.vec, ndim=1),         # [N, 7] gradient of gaussian parameters
@@ -225,4 +329,3 @@ def backward_kernel(config: RasterConfig,
 
 
   return _backward_kernel
-

@@ -11,6 +11,38 @@ Key differences are the rendering algorithm is decomposed into separate operatio
 
 Using the Taichi autodiff for a simpler implementation where possible (e.g. for projection, but not for the rasterization).
 
+## Mac / Metal fork status
+
+This fork carries an experimental Apple Silicon path for differentiable 2D
+Gaussian splat rasterization. The goal is to make the rasterizer usable from
+PyTorch on Macs while preserving the CUDA path for machines that have it.
+
+Current fork changes:
+
+* Adds non-CUDA sort/cumsum fallbacks behind `sort_backend` so the tile mapper
+  can run on MPS/Metal without `taichi_splatting.cuda_lib`.
+* Adds a `metal_reference` rasterizer variant that avoids CUDA-only Taichi SIMT
+  block/warp intrinsics and compiles on `ti.metal`.
+* Adds a `pixel_reference` backward path for Metal that matches a direct Torch
+  packed-2D Gaussian baseline in small forward/backward gradient checks.
+* Adds experimental Taichi-side sort modes:
+  * `taichi_field`: global Taichi ndarray scan/sort reference. Correct, but
+    slow.
+  * `bucket_taichi`: compact per-tile bucket sort. Correct in small gradient
+    checks and faster than the global Taichi sort, but still slower than the
+    current reference path.
+  * `ordered_taichi`: preserves input order inside each tile. Only correct when
+    callers already provide front-to-back sorted splats.
+
+Known limitations:
+
+* The fastest Mac path is still the reference path that uses PyTorch/MPS for
+  tile/depth ordering and Taichi/Metal for raster/backward.
+* The Taichi-native sort experiments are not performance wins yet. The next real
+  speed target is a fused tile-local sort and render kernel using Metal
+  threadgroup memory.
+* Low precision and per-splat backward are not implemented in the Metal path.
+
 Examples:
   * Projecting features for lifting 2D to 3D
   * Colours via. spherical harmonics

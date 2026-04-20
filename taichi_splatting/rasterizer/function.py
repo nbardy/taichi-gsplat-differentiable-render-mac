@@ -33,8 +33,7 @@ def render_function(config: RasterConfig,
                    dtype=torch.float32):
   
   forward = forward_kernel(config, feature_size=feature_size, dtype=torch_taichi[dtype])
-  backward = backward_kernel(config, points_requires_grad, features_requires_grad, 
-                           feature_size, dtype=torch_taichi[dtype])
+  backward = backward_kernel(config, points_requires_grad, features_requires_grad, feature_size, dtype=torch_taichi[dtype])
   
   forward = queued(forward)
   backward = queued(backward)
@@ -70,8 +69,11 @@ def render_function(config: RasterConfig,
       ctx.point_heuristic = point_heuristic
       ctx.visibility = visibility
 
-      ctx.mark_non_differentiable(image_alpha, overlap_to_point, tile_overlap_ranges, 
-                                visibility, point_heuristic)
+      if config.metal_compatible:
+        ctx.mark_non_differentiable(overlap_to_point, tile_overlap_ranges, visibility, point_heuristic)
+      else:
+        ctx.mark_non_differentiable(image_alpha, overlap_to_point, tile_overlap_ranges,
+                                  visibility, point_heuristic)
       ctx.save_for_backward(gaussians, features, image_feature)
 
       return image_feature, image_alpha, point_heuristic, visibility
@@ -79,16 +81,13 @@ def render_function(config: RasterConfig,
     @staticmethod
     def backward(ctx, grad_image_feature: torch.Tensor,
                 grad_alpha: torch.Tensor, grad_point_heuristics: torch.Tensor,
-                grad_visibility: torch.Tensor):
-      
-
-      
+      grad_visibility: torch.Tensor):
       gaussians, features, image_feature = ctx.saved_tensors
       grad_gaussians = torch.zeros_like(gaussians)
       grad_features = torch.zeros_like(features)
   
       backward(gaussians, features, ctx.tile_overlap_ranges, ctx.overlap_to_point,
-              image_feature, grad_image_feature.contiguous(),
+              image_feature, grad_image_feature.contiguous(), grad_alpha.contiguous(),
               grad_gaussians, grad_features, ctx.point_heuristic)
 
 
@@ -154,7 +153,13 @@ def rasterize(gaussians2d: torch.Tensor, depth: torch.Tensor,
     f"Size mismatch: got {gaussians2d.shape}, {depth.shape}, {features.shape}"
 
   overlap_to_point, tile_overlap_ranges = map_to_tiles(
-    gaussians2d, depth, image_size=image_size, config=config, use_depth16=use_depth16)
+    gaussians2d,
+    depth,
+    image_size=image_size,
+    config=config,
+    use_depth16=use_depth16,
+    sort_backend=config.sort_backend,
+  )
   
   return rasterize_with_tiles(
     gaussians2d, features,
