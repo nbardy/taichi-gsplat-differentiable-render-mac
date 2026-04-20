@@ -159,6 +159,19 @@ forward+backward, plus 4K / 65,536-splat hot-path timings around `12-14 ms`
 forward for its v3 path. Use that project when maximum speed matters more than
 Taichi integration.
 
+The 4K / 65,536-splat pure-Metal numbers are recorded explicitly in that repo:
+
+| Renderer | 4096x4096 / 65,536 splats | Forward | Forward+backward |
+| --- | --- | ---: | ---: |
+| `fast-mac-gsplat` v3 | sigma 1-5 px | `12.410 ms` | `47.872 ms` |
+| `fast-mac-gsplat` v3 | sigma 3-8 px | `13.702 ms` | `60.738 ms` |
+
+There is no direct Torch number for 4K / 65,536 splats because it is not a
+useful baseline. A dense vectorized Torch renderer would need to materialize
+roughly `4096 * 4096 * 65536 = 1.1e12` pixel-splat evaluations, which is
+terabytes of activation traffic before backward. A looped Torch reference avoids
+that one giant tensor but is still far too slow for an interactive benchmark.
+
 For detailed experiment notes and future directions, read [NOTES.md](NOTES.md).
 
 ## Search / Fork Positioning
