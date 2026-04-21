@@ -4,6 +4,8 @@ Fast splatting on the Mac integrated with Taichi.
 
 Taichi Gaussian Splat Renderer for Mac, Apple Silicon, MPS, and Metal.
 
+1000% faster than native torch, and allows 4k resolution and 200k or more splats, where torch ooms at 2k.
+
 ## Which Mac Renderer Should You Use?
 
 Use this repository when you need Taichi compatibility or want a Taichi-native
